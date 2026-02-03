@@ -1,0 +1,379 @@
+import pyodbc
+from ldap3 import Server, Connection, ALL
+import secrets, string
+import logging
+from datetime import datetime
+import requests
+import time
+import sys
+import os
+
+# === ЗАГРУЗКА КОНФИГУРАЦИИ ===
+try:
+    from config import (
+        TELEGRAM_TOKEN,
+        TELEGRAM_CHAT_ID,
+        SQL_SERVER,
+        SQL_DATABASE,
+        LDAP_SERVER,
+        LDAP_BIND_DN,
+        LDAP_BIND_PASS,
+        BASE_DN,
+        WIFI_NETWORK_NAME,
+        LOG_FILE_PATH,
+        SYNC_INTERVAL_SECONDS
+    )
+except ImportError:
+    print("❌ Ошибка: файл config.py не найден!")
+    print("📝 Скопируйте config.example.py в config.py и заполните данные")
+    sys.exit(1)
+
+
+def send_telegram(login, full_name, emp_id, password):
+    """Отправляет пароль в Telegram группу"""
+    bot_msg = f"""
+🆕 Wi-Fi учётка создана!
+
+👤 **{full_name}**
+🆔 RusGuard ID: `{emp_id}`
+🔑 **Логин:** `{login}`
+🔑 **Пароль:** `{password}`
+
+🌐 Сеть: {WIFI_NETWORK_NAME}  
+📶 Готов к использованию!
+    """
+    
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {
+        'chat_id': TELEGRAM_CHAT_ID,
+        'text': bot_msg,
+        'parse_mode': 'Markdown'
+    }
+    
+    try:
+        response = requests.post(url, data=data, timeout=10)
+        if response.status_code == 200:
+            logging.info(f"Telegram OK: {login}")
+            print(f"📱 Telegram отправлен: {login}")
+            return True
+        else:
+            logging.error(f"Telegram failed {login}: {response.text}")
+            print(f"📱 Telegram ошибка {login}: {response.status_code}")
+            return False
+    except Exception as e:
+        logging.error(f"Telegram error {login}: {e}")
+        print(f"📱 Telegram ошибка {login}: {e}")
+        return False
+
+
+def send_telegram_deleted(login, full_name, emp_id, reason):
+    """Отправляет уведомление об удалении учётки"""
+    bot_msg = f"""
+🗑️ Wi-Fi учётка удалена!
+
+👤 **{full_name}**
+🆔 RusGuard ID: `{emp_id}`
+🔑 **Логин:** `{login}`
+
+⚠️ Причина: {reason}
+🚫 Доступ к {WIFI_NETWORK_NAME} отключён
+    """
+    
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {
+        'chat_id': TELEGRAM_CHAT_ID,
+        'text': bot_msg,
+        'parse_mode': 'Markdown'
+    }
+    
+    try:
+        response = requests.post(url, data=data, timeout=10)
+        if response.status_code == 200:
+            logging.info(f"Telegram DELETE OK: {login}")
+            return True
+        else:
+            logging.error(f"Telegram DELETE failed {login}: {response.text}")
+            return False
+    except Exception as e:
+        logging.error(f"Telegram DELETE error {login}: {e}")
+        return False
+
+
+def gen_password(length=6):
+    alphabet = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
+
+
+def cyrillic_to_latin(text):
+    """Русские фамилии → транслит"""
+    mapping = {
+        'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'yo', 'ж': 'zh',
+        'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm', 'н': 'n', 'о': 'o',
+        'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u', 'ф': 'f', 'х': 'h', 'ц': 'ts',
+        'ч': 'ch', 'ш': 'sh', 'щ': 'sch', 'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya',
+        'А': 'A', 'Б': 'B', 'В': 'V', 'Г': 'G', 'Д': 'D', 'Е': 'E', 'Ё': 'Yo', 'Ж': 'Zh',
+        'З': 'Z', 'И': 'I', 'Й': 'Y', 'К': 'K', 'Л': 'L', 'М': 'M', 'Н': 'N', 'О': 'O',
+        'П': 'P', 'Р': 'R', 'С': 'S', 'Т': 'T', 'У': 'U', 'Ф': 'F', 'Х': 'H', 'Ц': 'Ts',
+        'Ч': 'Ch', 'Ш': 'Sh', 'Щ': 'Sch', 'Ъ': '', 'Ы': 'Y', 'Ь': '', 'Э': 'E', 'Ю': 'Yu', 'Я': 'Ya'
+    }
+    result = ''
+    for char in text:
+        result += mapping.get(char, char)
+    return result
+
+
+def do_sync():
+    """Основная функция синхронизации"""
+    
+    # === КОНФИГ ===
+    SQL_CONN_STR = (
+        f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+        f"SERVER={SQL_SERVER};"
+        f"DATABASE={SQL_DATABASE};"
+        f"Trusted_Connection=yes;"
+    )
+    
+    # === SQL ===
+    try:
+        print("📊 SQL: подключаемся...")
+        cnxn = pyodbc.connect(SQL_CONN_STR)
+        cursor = cnxn.cursor()
+        print("✅ SQL: OK")
+    except Exception as e:
+        print(f"❌ SQL ошибка: {e}")
+        logging.error(f"SQL connection failed: {e}")
+        return False
+
+    # === LDAP ===
+    try:
+        print("🔗 LDAP: подключаемся...")
+        server = Server(LDAP_SERVER, get_info=ALL)
+        ldap_conn = Connection(server, LDAP_BIND_DN, LDAP_BIND_PASS, auto_bind=True)
+        print("✅ LDAP: OK")
+    except Exception as e:
+        print(f"❌ LDAP ошибка: {e}")
+        logging.error(f"LDAP connection failed: {e}")
+        cnxn.close()
+        return False
+
+    # === ЧИТАЕМ АКТИВНЫХ СОТРУДНИКОВ ===
+    try:
+        print("👥 SQL: читаем активных сотрудников...")
+        cursor.execute("""
+            SELECT 
+                LastName AS Login,
+                CONCAT(LastName, ' ', FirstName, ' ', SecondName) AS FullName,
+                IntId
+            FROM Employee 
+            WHERE IsRemoved = 0 
+              AND LastName IS NOT NULL
+              AND IsLocked = 0
+            ORDER BY IntId
+        """)
+        active_users = cursor.fetchall()
+        print(f"📈 Найдено {len(active_users)} активных сотрудников (не заблокированных)")
+    except Exception as e:
+        print(f"❌ Ошибка чтения сотрудников: {e}")
+        logging.error(f"Error reading employees: {e}")
+        ldap_conn.unbind()
+        cnxn.close()
+        return False
+
+    # === СОЗДАЁМ МНОЖЕСТВО АКТИВНЫХ ЛОГИНОВ ===
+    active_logins = set()
+    for row in active_users:
+        login = cyrillic_to_latin(row.Login.strip())
+        if login:
+            active_logins.add(login.lower())
+
+    # === ЧИТАЕМ ВСЕ УЧЁТКИ ИЗ LDAP ===
+    try:
+        print("🔍 LDAP: читаем существующие учётки...")
+        ldap_conn.search(
+            BASE_DN, 
+            '(objectClass=inetOrgPerson)', 
+            attributes=['uid', 'cn', 'employeeNumber']
+        )
+        ldap_users = ldap_conn.entries
+        print(f"📊 В LDAP найдено {len(ldap_users)} учёток")
+    except Exception as e:
+        print(f"❌ Ошибка чтения LDAP: {e}")
+        logging.error(f"LDAP search error: {e}")
+        ldap_conn.unbind()
+        cnxn.close()
+        return False
+
+    # === СТАТИСТИКА ===
+    created = 0
+    telegram_sent = 0
+    updated = 0
+    deleted = 0
+    telegram_deleted_sent = 0
+    errors = 0
+
+    # === ФАЗА 1: УДАЛЕНИЕ НЕАКТИВНЫХ ===
+    print("\n🗑️  ФАЗА 1: Проверка неактивных учёток...\n")
+    
+    for ldap_entry in ldap_users:
+        ldap_login = str(ldap_entry.uid).lower()
+        
+        # Если логина НЕТ в активных — удаляем
+        if ldap_login not in active_logins:
+            try:
+                emp_num = str(ldap_entry.employeeNumber) if ldap_entry.employeeNumber else 'N/A'
+                full_name = str(ldap_entry.cn) if ldap_entry.cn else ldap_login
+                
+                print(f"🗑️  Удаляем: {ldap_login} (ID:{emp_num})", end=" ... ")
+                
+                if ldap_conn.delete(ldap_entry.entry_dn):
+                    logging.info(f"DELETED: {ldap_login} (ID:{emp_num})")
+                    print(f"✅ удалён")
+                    
+                    # Отправляем в Telegram
+                    if send_telegram_deleted(ldap_login, full_name, emp_num, "Пропуск заблокирован/удалён"):
+                        telegram_deleted_sent += 1
+                    
+                    deleted += 1
+                else:
+                    logging.error(f"Failed to delete {ldap_login}: {ldap_conn.result}")
+                    print(f"❌ ошибка удаления")
+                    errors += 1
+                    
+            except Exception as e:
+                logging.error(f"Error deleting {ldap_login}: {e}")
+                print(f"❌ {str(e)[:50]}")
+                errors += 1
+
+    # === ФАЗА 2: СОЗДАНИЕ НОВЫХ ===
+    print("\n✨ ФАЗА 2: Создание новых учёток...\n")
+
+    for idx, row in enumerate(active_users, 1):
+        login = cyrillic_to_latin(row.Login.strip())
+        full_name = row.FullName.strip()
+        emp_id = row.IntId
+        
+        if not login:
+            continue
+        
+        print(f"[{idx}/{len(active_users)}] {login}", end=" ... ")
+        
+        # Поиск в LDAP
+        try:
+            ldap_conn.search(BASE_DN, f"(uid={login})", attributes=['uid'])
+        except Exception as e:
+            print(f"❌ ошибка поиска: {str(e)[:40]}")
+            logging.error(f"LDAP search error for {login}: {e}")
+            errors += 1
+            continue
+        
+        if not ldap_conn.entries:
+            # СОЗДАЁМ
+            try:
+                password = gen_password()
+                
+                dn = f"uid={login},{BASE_DN}"
+                attrs = {
+                    'objectClass': ['inetOrgPerson', 'organizationalPerson', 'person', 'top'],
+                    'uid': login,
+                    'cn': full_name or login,
+                    'sn': login,
+                    'employeeNumber': str(emp_id),
+                    'userPassword': password,
+                    'description': f'WiFi user from RusGuard ID:{emp_id}'
+                }
+                
+                if ldap_conn.add(dn, attributes=attrs):
+                    msg = f"CREATED: {login} (ID:{emp_id}) pwd:{password}"
+                    logging.info(msg)
+                    print(f"✅ создан | pwd: {password}")
+                    
+                    # ОТПРАВЛЯЕМ В TELEGRAM
+                    if send_telegram(login, full_name, emp_id, password):   
+                        telegram_sent += 1
+                    else:
+                        print(f"  ⚠️ Telegram не отправлен")
+                    
+                    created += 1
+                else:
+                    msg = f"LDAP add failed: {login}"
+                    logging.error(msg)
+                    print(f"❌ ошибка LDAP")
+                    errors += 1
+            except Exception as e:
+                logging.error(f"Error creating {login}: {e}")
+                print(f"❌ {str(e)[:50]}")
+                errors += 1
+        else:
+            print(f"⏭️ уже есть")
+            updated += 1
+
+    print("\n" + "=" * 70)
+    print(f"✅ СОЗДАНО В LDAP: {created}")
+    print(f"📱 TELEGRAM (создано): {telegram_sent}")
+    print(f"🗑️  УДАЛЕНО ИЗ LDAP: {deleted}")
+    print(f"📱 TELEGRAM (удалено): {telegram_deleted_sent}")
+    print(f"⏭️  УЖЕ БЫЛО: {updated}")
+    print(f"❌ ОШИБОК: {errors}")
+    print(f"📋 Логи: {LOG_FILE_PATH}")
+    print("=" * 70)
+
+    logging.info(f"Sync completed: created={created}, deleted={deleted}, telegram_new={telegram_sent}, telegram_del={telegram_deleted_sent}, updated={updated}, errors={errors}")
+
+    ldap_conn.unbind()
+    cnxn.close()
+    print("🎉 Синхронизация завершена!\n")
+    
+    return True
+
+
+# === ГЛАВНЫЙ ЦИКЛ ===
+if __name__ == "__main__":
+    
+    # === ЛОГИРОВАНИЕ (один раз при старте) ===
+    logging.basicConfig(
+        filename=LOG_FILE_PATH, 
+        level=logging.INFO, 
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        encoding='utf-8',
+        filemode='a'
+    )
+    
+    print("=" * 70)
+    print("🚀 RusGuard ↔️ LDAP + Telegram синхронизация")
+    print("   ✅ Создание активных")
+    print("   🗑️  Удаление неактивных")
+    print(f"   Автозапуск: каждые {SYNC_INTERVAL_SECONDS // 60} минут")
+    print("=" * 70)
+    print("🛑 Для остановки: закрыть окно или Ctrl+C")
+    print("=" * 70 + "\n")
+    
+    logging.info("=== APP STARTED (with deletion support) ===")
+    
+    cycle_count = 0
+    
+    try:
+        while True:
+            cycle_count += 1
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            print(f"\n{'='*70}")
+            print(f"⏰ ЦИКЛ #{cycle_count} [{timestamp}]")
+            print(f"{'='*70}\n")
+            
+            logging.info(f"Sync cycle #{cycle_count} started")
+            
+            do_sync()
+            
+            print(f"⏳ Ожидание {SYNC_INTERVAL_SECONDS // 60} минут до следующей синхронизации...")
+            logging.info(f"Waiting {SYNC_INTERVAL_SECONDS} seconds...")
+            
+            time.sleep(SYNC_INTERVAL_SECONDS)
+            
+    except KeyboardInterrupt:
+        print("\n\n🛑 Остановлено пользователем (Ctrl+C)")
+        logging.info("App stopped by user")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n\n❌ КРИТИЧЕСКАЯ ОШИБКА: {e}")
+        logging.error(f"Critical error: {e}")
+        sys.exit(1)
